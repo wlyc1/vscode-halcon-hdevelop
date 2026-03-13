@@ -15,7 +15,7 @@
 			"outFiles": [
 				"${workspaceFolder}/dist/**/*.js"
 			],
-			"preLaunchTask": "${defaultBuildTask}"
+			"preLaunchTask": "npm: compile"  // 使用compile任务替代watch任务，避免启动超时
 		},
 		{
 			"name": "Extension Tests",

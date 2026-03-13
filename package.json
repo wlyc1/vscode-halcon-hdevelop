@@ -32,7 +32,7 @@
           "hdevelop"
         ],
         "extensions": [
-          ""
+          ".hdev"
         ],
         "configuration": "./language-configuration.json"
       },
@@ -67,7 +67,12 @@
         "displayName": "Halcon HDevelop",
         "selector": [
           {
+            "scheme": "file",
             "filenamePattern": "*.hdvp"
+          },
+          {
+            "scheme": "file",
+            "filenamePattern": "*.hdev"
           }
         ]
       }

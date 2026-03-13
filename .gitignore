@@ -3,3 +3,12 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+
+# 测试文件和样本文件
+hdev_sample/
+.trae/
+test/
+
+# 调试文件
+debug_xml.js
+test_parse_xml.js
