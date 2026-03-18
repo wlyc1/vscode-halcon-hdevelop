@@ -2,6 +2,7 @@
 import * as vscode from "vscode";
 import { TextDecoder, TextEncoder } from "util";
 import { XMLBuilder, XMLParser } from "fast-xml-parser";
+import { ApiSection, formatAPIParameters, resolveApiSectionCells } from "./HDevelopApi";
 import { HDevelopFormatter } from "./HDevelopFormatter";
 
 interface ProcedureParameter {
@@ -59,6 +60,22 @@ interface HDevelopNotebookMetadata {
   selectedProcedure?: string;
 }
 
+interface HDevelopApiCellMetadata {
+  apiSection?: ApiSection;
+}
+
+interface HDevelopProcedureHeaderCellMetadata {
+  cellRole?: 'procedureHeader';
+  procedureName?: string;
+  signature?: string;
+}
+
+interface HDevelopProcedureCellMetadata {
+  procedureName?: string;
+  signature?: string;
+  cellRole?: 'procedureHeader' | 'procedureApi' | 'procedureCode';
+}
+
 interface HDevelopNotebookData extends vscode.NotebookData {
   metadata: HDevelopNotebookMetadata;
 }
@@ -80,16 +97,98 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
   private static readonly textEncoder = new TextEncoder();
   private static readonly formatter = new HDevelopFormatter();
 
+  private static extractSignatureParameters(proc: any): Array<{
+    direction: 'INPUT' | 'OUTPUT';
+    baseType: string;
+    name: string;
+    dimension: number;
+  }> {
+    const procParts = proc.procedure;
+    const interfacePart = procParts.find((p: any) => p.interface);
+    const api = interfacePart?.interface;
+    if (!Array.isArray(api) || api.length === 0) {
+      return [];
+    }
+
+    const params: Array<{
+      direction: 'INPUT' | 'OUTPUT';
+      baseType: string;
+      name: string;
+      dimension: number;
+    }> = [];
+
+    for (const section of api) {
+      const sectionKey = (["io", "oo", "ic", "oc"] as const).find((key) => Array.isArray(section?.[key]));
+      if (!sectionKey) {
+        continue;
+      }
+
+      const direction = sectionKey === "io" || sectionKey === "ic" ? "INPUT" : "OUTPUT";
+
+      for (const param of section[sectionKey] as any[]) {
+        const paramData = param?.[":@"];
+        const name = paramData?.["@_name"];
+        if (!name) {
+          continue;
+        }
+
+        params.push({
+          direction,
+          baseType: paramData?.["@_base_type"] || "ctrl",
+          name,
+          dimension: Number(paramData?.["@_dimension"] || 0),
+        });
+      }
+    }
+
+    return params;
+  }
+
+  private static buildCompactProcedureHeader(
+    procedureName: string,
+    signature: string,
+    counts: {
+      inputObjects: number;
+      outputObjects: number;
+      inputControls: number;
+      outputControls: number;
+      codeLines: number;
+    }
+  ): string {
+    void counts;
+    const displaySignature = signature
+      .slice(1, -1)
+      .replace(/\[INPUT\]/g, '<span style="color: var(--vscode-terminal-ansiGreen); font-weight: 700; letter-spacing: 0.02em;">INPUT</span>')
+      .replace(/\[OUTPUT\]/g, '<span style="color: var(--vscode-terminal-ansiYellow); font-weight: 700; letter-spacing: 0.02em;">OUTPUT</span>')
+      .replace(/\biconic\b/g, '<span style="color: var(--vscode-textLink-foreground); font-weight: 600;">iconic</span>')
+      .replace(/\bctrl\b/g, '<span style="color: var(--vscode-textLink-foreground); font-weight: 600;">ctrl</span>');
+
+    return `##### <span style="font-weight: 400;">${procedureName}</span><span style="font-size: 0.92em; font-weight: 400; color: var(--vscode-descriptionForeground);">(${displaySignature})</span>`;
+  }
+
+  private static buildProcedureSignature(proc: any): string {
+    try {
+      const params = this.extractSignatureParameters(proc);
+      if (params.length === 0) {
+        return "()";
+      }
+
+      return `(${params.map((param) => {
+        const dimensionSuffix = param.dimension > 0 ? `[${param.dimension}]` : "";
+        return `[${param.direction}] ${param.baseType} ${param.name}${dimensionSuffix}`;
+      }).join(", ")})`;
+    } catch (error) {
+      console.error("[halcon-hdevelop] 构建函数签名时出错:", error);
+      return "()";
+    }
+  }
+
   private static parseData(fileContent: Uint8Array): XMLData {
-    console.log('[halcon-hdevelop] 开始解析 HDevelop XML 文件');
-    
     const decodedContent = HDevelopSerializer.textDecoder.decode(fileContent);
-    console.log('[halcon-hdevelop] XML 内容长度:', decodedContent.length);
     
     let data: XMLData;
     try {
       data = HDevelopSerializer.parser.parse(decodedContent) as XMLData;
-      console.log('[halcon-hdevelop] XML 解析成功');
 
       if (data.length < 1 || data[0][":@"] === undefined || data[0][":@"]["@_version"] === undefined) {
         throw new Error("Invalid file: Could not find XML header and version!");
@@ -110,8 +209,6 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         return container.procedure && Array.isArray(container.procedure);
       });
       
-      console.log('[halcon-hdevelop] 检测到 procedure 数量:', procedureContainers.length);
-      
       // Normalize each procedure to ensure consistent structure
       procedureContainers.forEach((container: any, index: number) => {
         const procName = container[":@"]?.["@_name"] || `procedure_${index}`;
@@ -119,7 +216,6 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         
         // 检查 procParts 是否存在
         if (!procParts) {
-          console.log(`[halcon-hdevelop] procedure_${index} 没有 procedure 元素，创建默认结构`);
           container.procedure = [];
           procParts = container.procedure;
         }
@@ -177,13 +273,11 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
           }
         }
         
-        console.log(`[halcon-hdevelop] 标准化 procedure: ${procName}`);
       });
 
       data[0][":@"]["@_version"] = "1.0";
       // 更新 hdevelop 数组为过滤后的结果
       data[1].hdevelop = procedureContainers;
-      console.log('[halcon-hdevelop] XML 文件解析完成');
       
       return data;
     } catch (error) {
@@ -286,44 +380,11 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
   }
 
   private static deserializeAPIParameters(
-    parameters: ProcedureParameter[], 
+    parameters: ProcedureParameter[],
     descriptions: Map<string, string> = new Map(),
     ioType?: 'input' | 'output'
   ): string {
-    if (!parameters || parameters.length === 0) {
-      return '';
-    }
-    
-    const lines = parameters.map((parameter) => {
-      try {
-        const paramData = parameter[":@"];
-        if (!paramData) {
-          return '';
-        }
-        const baseType = paramData["@_base_type"] || 'ctrl';
-        const dimension = paramData["@_dimension"] || 0;
-        const name = paramData["@_name"] || '';
-        
-        if (!name) {
-          return '';
-        }
-
-        const dimensionSuffix = (dimension !== 0) ? `[${dimension}]` : '';
-        const ioStatusPrefix = ioType ? `[${ioType === 'input' ? 'INPUT' : 'OUTPUT'}] ` : '';
-
-        const description = descriptions.get(name) || '';
-        const descriptionComment = description ? `  // ${description}` : '';
-
-        return `${ioStatusPrefix}${baseType} ${name}${dimensionSuffix}${descriptionComment}`;
-      } catch (error) {
-        console.error('[halcon-hdevelop] 反序列化 API 参数时出错:', error);
-        return '';
-      }
-    });
-    
-    const result = lines.filter(line => line.length > 0).join('\n');
-    console.log('[halcon-hdevelop] deserializeAPIParameters 结果:', result);
-    return result;
+    return formatAPIParameters(parameters, descriptions, ioType);
   }
 
   private static extractParametersFromSection(
@@ -350,9 +411,10 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
     const inputObjects = HDevelopSerializer.extractParametersFromSection(api, 'io');
     const docuPart = procParts.find((p: any) => p.docu);
     const descriptions = HDevelopSerializer.extractParameterDescriptions(docuPart?.docu);
-    const code = HDevelopSerializer.deserializeAPIParameters(inputObjects, descriptions);
-
-    return new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api')
+    const code = HDevelopSerializer.deserializeAPIParameters(inputObjects, descriptions, 'input');
+    const cell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api');
+    cell.metadata = { apiSection: 'io' } as HDevelopApiCellMetadata;
+    return cell;
   }
 
   private deserializeOutputObjectCell(data: XMLData): vscode.NotebookCellData {
@@ -363,9 +425,10 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
     const outputObjects = HDevelopSerializer.extractParametersFromSection(api, 'oo');
     const docuPart = procParts.find((p: any) => p.docu);
     const descriptions = HDevelopSerializer.extractParameterDescriptions(docuPart?.docu);
-    const code = HDevelopSerializer.deserializeAPIParameters(outputObjects, descriptions);
-
-    return new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api')
+    const code = HDevelopSerializer.deserializeAPIParameters(outputObjects, descriptions, 'output');
+    const cell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api');
+    cell.metadata = { apiSection: 'oo' } as HDevelopApiCellMetadata;
+    return cell;
   }
 
   private deserializeInputControlCell(data: XMLData): vscode.NotebookCellData {
@@ -378,10 +441,9 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
     const descriptions = HDevelopSerializer.extractParameterDescriptions(docuPart?.docu);
     const code = HDevelopSerializer.deserializeAPIParameters(inputControls, descriptions, 'input');
 
-    console.log('[halcon-hdevelop] deserializeInputControlCell - inputControls:', inputControls);
-    console.log('[halcon-hdevelop] deserializeInputControlCell - code:', code);
-
-    return new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api')
+    const cell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api');
+    cell.metadata = { apiSection: 'ic' } as HDevelopApiCellMetadata;
+    return cell;
   }
 
   private deserializeOutputControlCell(data: XMLData): vscode.NotebookCellData {
@@ -394,7 +456,25 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
     const descriptions = HDevelopSerializer.extractParameterDescriptions(docuPart?.docu);
     const code = HDevelopSerializer.deserializeAPIParameters(outputControls, descriptions, 'output');
 
-    return new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api')
+    const cell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, code, 'hdevelop.api');
+    cell.metadata = { apiSection: 'oc' } as HDevelopApiCellMetadata;
+    return cell;
+  }
+
+  private static attachProcedureMetadata(
+    cell: vscode.NotebookCellData,
+    procedureName: string,
+    signature: string,
+    cellRole: HDevelopProcedureCellMetadata['cellRole']
+  ): vscode.NotebookCellData {
+    cell.metadata = {
+      ...(cell.metadata as Record<string, unknown> | undefined),
+      procedureName,
+      signature,
+      cellRole,
+    } as HDevelopProcedureCellMetadata & HDevelopApiCellMetadata;
+
+    return cell;
   }
 
   async deserializeNotebook(
@@ -409,43 +489,10 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
 
       cells.push(new vscode.NotebookCellData(
         vscode.NotebookCellKind.Markup,
-        '# Halcon HDevelop Procedures\n\nSelect a procedure from the list above to view its code.',
+        '**HDevelop Procedures**\n\nCompact notebook view for procedures, parameters, and code.',
         'markdown'
       ));
 
-    const buildProcedureSignature = (proc: any): string => {
-      try {
-        const procParts = proc.procedure;
-        const interfacePart = procParts.find((p: any) => p.interface);
-        const api = interfacePart?.interface;
-        if (!api) {
-          return "()";
-        }
-        
-        const params: string[] = [];
-        
-        const extractParamNames = (section: 'io' | 'ic'): void => {
-          for (const item of api) {
-            if (item && item[section] && Array.isArray(item[section])) {
-              item[section].forEach((param: any) => {
-                if (param?.[":@"]?.["@_name"]) {
-                  params.push(param[":@"]["@_name"]);
-                }
-              });
-            }
-          }
-        };
-        
-        extractParamNames('io');
-        extractParamNames('ic');
-        
-        return `(${params.join(", ")})`;
-      } catch (error) {
-        console.error('[halcon-hdevelop] 构建函数签名时出错:', error);
-        return "()";
-      }
-    };
-    
     procedures.forEach((procedure: any, index: number) => {
       try {
         const procedureName = procedure[":@"]?.["@_name"] || `procedure_${index}`;
@@ -453,7 +500,6 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         // 检查 procedure 是否有实际内容
         const procParts = procedure.procedure;
         if (!procParts || !Array.isArray(procParts)) {
-          console.log(`[halcon-hdevelop] 跳过空的 procedure: ${procedureName}`);
           return;
         }
         
@@ -462,7 +508,6 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         
         // 检查 body 是否为空
         if (body.length === 0) {
-          console.log(`[halcon-hdevelop] 跳过没有 body 内容的 procedure: ${procedureName}`);
           return;
         }
         
@@ -483,42 +528,55 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         });
         
         if (!hasActualContent) {
-          console.log(`[halcon-hdevelop] 跳过没有实际代码的 procedure: ${procedureName}`);
           return;
         }
         
-        const signature = buildProcedureSignature(procedure);
-        
-        cells.push(new vscode.NotebookCellData(
-          vscode.NotebookCellKind.Markup,
-          `### ${procedureName}${signature}`,
-          'markdown'
-        ));
-
+        const signature = HDevelopSerializer.buildProcedureSignature(procedure);
         const procedureData: XMLData = [
           hdevelopData[0],
           { hdevelop: [procedure] }
         ];
-
         const inputObjectsCell = this.deserializeInputObjectCell(procedureData);
         const outputObjectsCell = this.deserializeOutputObjectCell(procedureData);
         const inputControlsCell = this.deserializeInputControlCell(procedureData);
         const outputControlsCell = this.deserializeOutputControlCell(procedureData);
         const codeCell = this.deserializeCodeCell(procedureData);
+        const codeLineCount = codeCell.value
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line.length > 0).length;
+        
+        const headerCell = new vscode.NotebookCellData(
+          vscode.NotebookCellKind.Markup,
+          HDevelopSerializer.buildCompactProcedureHeader(procedureName, signature, {
+            inputObjects: inputObjectsCell.value.trim() ? inputObjectsCell.value.split('\n').filter(line => line.trim().length > 0).length : 0,
+            outputObjects: outputObjectsCell.value.trim() ? outputObjectsCell.value.split('\n').filter(line => line.trim().length > 0).length : 0,
+            inputControls: inputControlsCell.value.trim() ? inputControlsCell.value.split('\n').filter(line => line.trim().length > 0).length : 0,
+            outputControls: outputControlsCell.value.trim() ? outputControlsCell.value.split('\n').filter(line => line.trim().length > 0).length : 0,
+            codeLines: codeLineCount,
+          }),
+          'markdown'
+        );
+        headerCell.metadata = {
+          cellRole: 'procedureHeader',
+          procedureName,
+          signature,
+        } as HDevelopProcedureHeaderCellMetadata;
+        cells.push(headerCell);
         
         if (inputObjectsCell.value.trim()) {
-          cells.push(inputObjectsCell);
+          cells.push(HDevelopSerializer.attachProcedureMetadata(inputObjectsCell, procedureName, signature, 'procedureApi'));
         }
         if (outputObjectsCell.value.trim()) {
-          cells.push(outputObjectsCell);
+          cells.push(HDevelopSerializer.attachProcedureMetadata(outputObjectsCell, procedureName, signature, 'procedureApi'));
         }
         if (inputControlsCell.value.trim()) {
-          cells.push(inputControlsCell);
+          cells.push(HDevelopSerializer.attachProcedureMetadata(inputControlsCell, procedureName, signature, 'procedureApi'));
         }
         if (outputControlsCell.value.trim()) {
-          cells.push(outputControlsCell);
+          cells.push(HDevelopSerializer.attachProcedureMetadata(outputControlsCell, procedureName, signature, 'procedureApi'));
         }
-        cells.push(codeCell);
+        cells.push(HDevelopSerializer.attachProcedureMetadata(codeCell, procedureName, signature, 'procedureCode'));
       } catch (error) {
         console.error(`[halcon-hdevelop] 处理 procedure ${index}时出错:`, error);
         cells.push(new vscode.NotebookCellData(
@@ -595,7 +653,6 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
       const groups = lineWithoutPrefix.match("^\\s*(iconic|ctrl)\\s+([$_a-zA-Z][$_a-zA-Z0-9]*)\\s*(?:\\[(\\d+)\\])?\\s*$")
 
       if (groups === null) {
-        console.log('[halcon-hdevelop] 跳过不匹配的行:', line);
         continue;
       }
 
@@ -632,14 +689,9 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
     const content = data.metadata.originalContent;
     const procedures = content[1].hdevelop;
     
-    console.log('[halcon-hdevelop] 开始序列化笔记本');
-    console.log('[halcon-hdevelop] procedure 数量:', procedures.length);
-    
     let cellIndex = 1;
     
     procedures.forEach((procedure: any, index: number) => {
-      console.log('[halcon-hdevelop] 处理 procedure:', procedure[":@"]?.["@_name"]);
-      
       const apiCells: vscode.NotebookCellData[] = [];
       let codeCell: vscode.NotebookCellData | null = null;
       
@@ -649,39 +701,32 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         if (cell.kind === vscode.NotebookCellKind.Markup) {
           // 如果已经收集了 cells，说明遇到了下一个 procedure
           if (apiCells.length > 0 || codeCell) {
-            console.log(`[halcon-hdevelop] 遇到新的 procedure 标题，停止`);
             break;
           }
-          console.log(`[halcon-hdevelop] 跳过 markup cell`);
           cellIndex++;
           continue;
         }
         if (cell.languageId === 'hdevelop.api') {
-          console.log(`[halcon-hdevelop] 收集 API cell`);
           apiCells.push(cell);
           cellIndex++;
         } else if (cell.languageId === 'hdevelop') {
-          console.log(`[halcon-hdevelop] 找到 Code cell`);
           codeCell = cell;
           cellIndex++;
           break;
         }
       }
       
-      while (apiCells.length < 4) {
-        apiCells.unshift(new vscode.NotebookCellData(vscode.NotebookCellKind.Code, '', 'hdevelop.api'));
-      }
+      const resolvedApiCells = resolveApiSectionCells(apiCells);
+      const emptyApiCell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, '', 'hdevelop.api');
       
       if (!codeCell) {
         codeCell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, '', 'hdevelop');
       }
       
-      const ioParams = HDevelopSerializer.serializeAPIParameters(apiCells[0]);
-      const ooParams = HDevelopSerializer.serializeAPIParameters(apiCells[1]);
-      const icParams = HDevelopSerializer.serializeAPIParameters(apiCells[2]);
-      const ocParams = HDevelopSerializer.serializeAPIParameters(apiCells[3]);
-      
-      console.log('[halcon-hdevelop] ioParams:', ioParams.length, 'ooParams:', ooParams.length, 'icParams:', icParams.length, 'ocParams:', ocParams.length);
+      const ioParams = HDevelopSerializer.serializeAPIParameters(resolvedApiCells.io ?? emptyApiCell);
+      const ooParams = HDevelopSerializer.serializeAPIParameters(resolvedApiCells.oo ?? emptyApiCell);
+      const icParams = HDevelopSerializer.serializeAPIParameters(resolvedApiCells.ic ?? emptyApiCell);
+      const ocParams = HDevelopSerializer.serializeAPIParameters(resolvedApiCells.oc ?? emptyApiCell);
       
       const procParts = procedure.procedure;
       
@@ -715,16 +760,10 @@ export class HDevelopSerializer implements vscode.NotebookSerializer {
         docuPart.docu = docu;
       }
       
-      console.log('[halcon-hdevelop] procedure 更新完成:', procedure[":@"]?.["@_name"]);
     });
-
-    console.log('[halcon-hdevelop] 开始构建 XML');
     
     const fileContents = HDevelopSerializer.serializer.build(content);
-    console.log('[halcon-hdevelop] XML 输出长度:', fileContents.length);
     
-    const result = HDevelopSerializer.textEncoder.encode(fileContents);
-    console.log('[halcon-hdevelop] 序列化完成，字节数:', result.length);
-    return result;
+    return HDevelopSerializer.textEncoder.encode(fileContents);
   }
 }

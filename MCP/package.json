@@ -1,0 +1,16 @@
+{
+  "name": "hdev-mcp-export",
+  "private": true,
+  "version": "1.0.2",
+  "description": "Exported MCP runtime for vscode-halcon-hdevelop",
+  "main": "dist/mcp/mcp-server.js",
+  "scripts": {
+    "start": "node dist/mcp/mcp-server.js",
+    "start:simple": "node dist/mcp-simple/mcp-server-simple.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "fast-xml-parser": "^4.0.10",
+    "zod": "^3.24.0"
+  }
+}

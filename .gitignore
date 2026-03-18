@@ -3,12 +3,21 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+MCP/node_modules/
+!MCP/dist/
+!MCP/dist/**
 
 # 测试文件和样本文件
 hdev_sample/
 .trae/
 test/
+src/test/
+test_*.js
 
 # 调试文件
 debug_xml.js
 test_parse_xml.js
+scrape_operators.js
+
+# IDE files
+.vscode/
